@@ -1,0 +1,715 @@
+name: Ninja Ball APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check required files
+        run: |
+          test -f index.html || { echo "index.html repo ildizida topilmadi"; ls -la; exit 1; }
+          test -f ninja_ball_icon.png || { echo "ninja_ball_icon.png repo ildizida topilmadi"; ls -la; exit 1; }
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-34 build-tools;34.0.0'
+
+      - name: Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Generate Android project
+        run: |
+          set -e
+          mkdir -p "$GITHUB_WORKSPACE/_android"
+          cd "$GITHUB_WORKSPACE/_android"
+          cat > 'settings.gradle' <<'__EOF__'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "NinjaBall"
+          include ':app'
+          __EOF__
+          cat > 'build.gradle' <<'__EOF__'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          __EOF__
+          cat > 'gradle.properties' <<'__EOF__'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          __EOF__
+          mkdir -p "app"
+          cat > 'app/build.gradle' <<'__EOF__'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.ninjaball.game'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.ninjaball.game"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              buildTypes {
+                  release { minifyEnabled false }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              lint { abortOnError false }
+          }
+          __EOF__
+          mkdir -p "app/src/main"
+          cat > 'app/src/main/AndroidManifest.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <!-- Local network only: no internet is used by the game. INTERNET is the Android permission for ANY socket (incl. LAN). -->
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="@string/app_name"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          __EOF__
+          mkdir -p "app/src/main/res/values"
+          cat > 'app/src/main/res/values/strings.xml' <<'__EOF__'
+          <resources>
+              <string name="app_name">Ninja Ball</string>
+          </resources>
+          __EOF__
+          mkdir -p "app/src/main/java/com/ninjaball/game"
+          cat > 'app/src/main/java/com/ninjaball/game/WsServer.java' <<'__EOF__'
+          package com.ninjaball.game;
+
+          import java.io.*;
+          import java.net.*;
+          import java.nio.charset.StandardCharsets;
+          import java.security.MessageDigest;
+          import java.util.*;
+          import java.util.concurrent.*;
+
+          /**
+           * Minimal RFC 6455 WebSocket server (text frames only), no external libraries,
+           * no internet. Holds at most ONE client (2-player room: host + 1 guest).
+           * A second connection is refused with HTTP 409 unless it uses the same ?id= (reconnect).
+           */
+          public class WsServer {
+              public interface Listener {
+                  void onOpen(String addr);
+                  void onMessage(String text);
+                  void onClose();
+              }
+
+              private static final String GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+              private final int port;
+              private final Listener listener;
+              private ServerSocket server;
+              private volatile boolean running;
+              private final Object lock = new Object();
+              private Conn current;
+              private final ThreadPoolExecutor writer = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
+                      new LinkedBlockingQueue<Runnable>(512), new ThreadPoolExecutor.DiscardOldestPolicy());
+
+              public WsServer(int port, Listener l) {
+                  this.port = port;
+                  this.listener = l;
+              }
+
+              public void start() throws IOException {
+                  server = new ServerSocket();
+                  server.setReuseAddress(true);
+                  server.bind(new InetSocketAddress(port)); // 0.0.0.0 -> reachable over hotspot / Wi-Fi
+                  running = true;
+                  Thread t = new Thread(new Runnable() { public void run() { acceptLoop(); } }, "ws-accept");
+                  t.setDaemon(true);
+                  t.start();
+              }
+
+              public int getPort() { return server.getLocalPort(); }
+
+              public void stop() {
+                  running = false;
+                  try { if (server != null) server.close(); } catch (IOException ignored) { }
+                  Conn c;
+                  synchronized (lock) { c = current; current = null; }
+                  if (c != null) c.close();
+                  writer.shutdownNow();
+              }
+
+              /** Send a text message to the connected client (asynchronous, never blocks the caller). */
+              public boolean send(final String text) {
+                  final Conn c;
+                  synchronized (lock) { c = current; }
+                  if (c == null || !c.alive) return false;
+                  try {
+                      writer.execute(new Runnable() { public void run() { c.sendFrame(0x1, text.getBytes(StandardCharsets.UTF_8)); } });
+                  } catch (RejectedExecutionException e) { return false; }
+                  return true;
+              }
+
+              public void kick() {
+                  Conn c;
+                  synchronized (lock) { c = current; }
+                  if (c != null) c.close();
+              }
+
+              private void acceptLoop() {
+                  while (running) {
+                      try {
+                          final Socket s = server.accept();
+                          Thread t = new Thread(new Runnable() { public void run() { handle(s); } }, "ws-conn");
+                          t.setDaemon(true);
+                          t.start();
+                      } catch (IOException e) {
+                          if (!running) return;
+                      }
+                  }
+              }
+
+              private void handle(Socket s) {
+                  Conn c = null;
+                  try {
+                      s.setTcpNoDelay(true);
+                      s.setSoTimeout(8000); // handshake timeout
+                      InputStream in = new BufferedInputStream(s.getInputStream(), 8192);
+                      OutputStream out = s.getOutputStream();
+                      String head = readHeaders(in);
+                      if (head == null) { s.close(); return; }
+                      String[] lines = head.split("\r\n");
+                      String[] rl = lines[0].split(" ");
+                      String path = rl.length > 1 ? rl[1] : "/";
+                      Map<String, String> h = new HashMap<String, String>();
+                      for (int i = 1; i < lines.length; i++) {
+                          int k = lines[i].indexOf(':');
+                          if (k > 0) h.put(lines[i].substring(0, k).trim().toLowerCase(Locale.ROOT), lines[i].substring(k + 1).trim());
+                      }
+                      String key = h.get("sec-websocket-key");
+                      String up = h.get("upgrade");
+                      if (key == null || up == null || !up.equalsIgnoreCase("websocket")) {
+                          httpReply(out, "400 Bad Request", "Ninja Ball room: WebSocket only");
+                          s.close();
+                          return;
+                      }
+                      String id = queryParam(path, "id");
+                      synchronized (lock) {
+                          if (current != null && current.alive) {
+                              if (id != null && id.equals(current.id)) {
+                                  current.close(); // same player reconnecting: replace silently
+                              } else {
+                                  httpReply(out, "409 Conflict", "Room is full");
+                                  s.close();
+                                  return;
+                              }
+                          }
+                          c = new Conn(s, in, out, id);
+                          current = c;
+                      }
+                      String accept = base64(MessageDigest.getInstance("SHA-1").digest((key + GUID).getBytes(StandardCharsets.ISO_8859_1)));
+                      String resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n";
+                      synchronized (c.outLock) { out.write(resp.getBytes(StandardCharsets.ISO_8859_1)); out.flush(); }
+                      s.setSoTimeout(0);
+                      listener.onOpen(String.valueOf(s.getInetAddress().getHostAddress()));
+                      c.readLoop();
+                  } catch (Exception e) {
+                      // connection error -> falls through to cleanup
+                  } finally {
+                      if (c != null) {
+                          boolean wasCurrent;
+                          synchronized (lock) { wasCurrent = (current == c); if (wasCurrent) current = null; }
+                          c.close();
+                          if (wasCurrent && running) listener.onClose();
+                      } else {
+                          try { s.close(); } catch (IOException ignored) { }
+                      }
+                  }
+              }
+
+              private static String readHeaders(InputStream in) throws IOException {
+                  ByteArrayOutputStream b = new ByteArrayOutputStream();
+                  int state = 0, x;
+                  while ((x = in.read()) >= 0) {
+                      b.write(x);
+                      if (b.size() > 8192) return null;
+                      if ((state == 0 || state == 2) && x == '\r') state++;
+                      else if ((state == 1 || state == 3) && x == '\n') { state++; if (state == 4) break; }
+                      else state = 0;
+                  }
+                  return x < 0 ? null : new String(b.toByteArray(), StandardCharsets.ISO_8859_1);
+              }
+
+              private static void httpReply(OutputStream out, String status, String body) throws IOException {
+                  String r = "HTTP/1.1 " + status + "\r\nContent-Type: text/plain\r\nContent-Length: " + body.length() + "\r\nConnection: close\r\n\r\n" + body;
+                  out.write(r.getBytes(StandardCharsets.ISO_8859_1));
+                  out.flush();
+              }
+
+              private static String queryParam(String path, String name) {
+                  int q = path.indexOf('?');
+                  if (q < 0) return null;
+                  for (String kv : path.substring(q + 1).split("&")) {
+                      int e = kv.indexOf('=');
+                      if (e > 0 && kv.substring(0, e).equals(name)) return kv.substring(e + 1);
+                  }
+                  return null;
+              }
+
+              private static String base64(byte[] d) {
+                  final String A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                  StringBuilder sb = new StringBuilder();
+                  for (int i = 0; i < d.length; i += 3) {
+                      int n = (d[i] & 255) << 16 | (i + 1 < d.length ? (d[i + 1] & 255) << 8 : 0) | (i + 2 < d.length ? (d[i + 2] & 255) : 0);
+                      sb.append(A.charAt(n >> 18 & 63)).append(A.charAt(n >> 12 & 63));
+                      sb.append(i + 1 < d.length ? A.charAt(n >> 6 & 63) : '=').append(i + 2 < d.length ? A.charAt(n & 63) : '=');
+                  }
+                  return sb.toString();
+              }
+
+              private class Conn {
+                  final Socket s; final InputStream in; final OutputStream out; final String id;
+                  final Object outLock = new Object();
+                  volatile boolean alive = true;
+
+                  Conn(Socket s, InputStream in, OutputStream out, String id) { this.s = s; this.in = in; this.out = out; this.id = id; }
+
+                  void close() {
+                      alive = false;
+                      try { s.close(); } catch (IOException ignored) { }
+                  }
+
+                  void sendFrame(int op, byte[] p) {
+                      if (!alive) return;
+                      try {
+                          synchronized (outLock) {
+                              out.write(0x80 | op);
+                              if (p.length < 126) out.write(p.length);
+                              else if (p.length < 65536) { out.write(126); out.write(p.length >> 8); out.write(p.length & 255); }
+                              else { out.write(127); for (int i = 7; i >= 0; i--) out.write((int) (((long) p.length >> (8 * i)) & 255)); }
+                              out.write(p);
+                              out.flush();
+                          }
+                      } catch (IOException e) { close(); }
+                  }
+
+                  void readLoop() throws IOException {
+                      DataInputStream d = new DataInputStream(in);
+                      ByteArrayOutputStream frag = null;
+                      while (alive) {
+                          int b0 = d.read();
+                          if (b0 < 0) return;
+                          int b1 = d.read();
+                          if (b1 < 0) return;
+                          boolean fin = (b0 & 0x80) != 0;
+                          int op = b0 & 0x0f;
+                          boolean masked = (b1 & 0x80) != 0;
+                          long len = b1 & 0x7f;
+                          if (len == 126) len = d.readUnsignedShort();
+                          else if (len == 127) len = d.readLong();
+                          if (len < 0 || len > (1 << 20)) return;
+                          byte[] mask = new byte[4];
+                          if (masked) d.readFully(mask);
+                          byte[] p = new byte[(int) len];
+                          d.readFully(p);
+                          if (masked) for (int i = 0; i < p.length; i++) p[i] ^= mask[i & 3];
+                          switch (op) {
+                              case 0x8: sendFrame(0x8, new byte[0]); return;
+                              case 0x9: sendFrame(0xA, p); break;
+                              case 0xA: break;
+                              case 0x1: case 0x2: case 0x0:
+                                  if (op != 0) { frag = new ByteArrayOutputStream(); }
+                                  if (frag == null) break;
+                                  frag.write(p);
+                                  if (fin) {
+                                      String text = new String(frag.toByteArray(), StandardCharsets.UTF_8);
+                                      frag = null;
+                                      listener.onMessage(text);
+                                  }
+                                  break;
+                              default: break;
+                          }
+                      }
+                  }
+              }
+          }
+          __EOF__
+          mkdir -p "app/src/main/java/com/ninjaball/game"
+          cat > 'app/src/main/java/com/ninjaball/game/LanDiscovery.java' <<'__EOF__'
+          package com.ninjaball.game;
+
+          import java.net.*;
+          import java.nio.charset.StandardCharsets;
+          import java.util.*;
+
+          /** UDP LAN beacon (host) + listener (guest) so the joiner can find rooms without typing the IP. No internet. */
+          public class LanDiscovery {
+              public static final int UDP_PORT = 8766;
+              public interface Found { void onFound(String ip, int port, String name); }
+
+              private volatile boolean beaconOn, listenOn;
+              private DatagramSocket beaconSock, listenSock;
+
+              public synchronized void startBeacon(final String name, final int port) {
+                  stopBeacon();
+                  beaconOn = true;
+                  Thread t = new Thread(new Runnable() {
+                      public void run() {
+                          try {
+                              beaconSock = new DatagramSocket();
+                              beaconSock.setBroadcast(true);
+                              byte[] data = ("NINJABALL1|" + name.replace('|', ' ') + "|" + port).getBytes(StandardCharsets.UTF_8);
+                              while (beaconOn) {
+                                  for (InetAddress a : broadcastTargets()) {
+                                      try { beaconSock.send(new DatagramPacket(data, data.length, a, UDP_PORT)); } catch (Exception ignored) { }
+                                  }
+                                  Thread.sleep(1000);
+                              }
+                          } catch (Exception ignored) {
+                          } finally { if (beaconSock != null) beaconSock.close(); }
+                      }
+                  }, "beacon");
+                  t.setDaemon(true);
+                  t.start();
+              }
+
+              public synchronized void stopBeacon() {
+                  beaconOn = false;
+                  if (beaconSock != null) beaconSock.close();
+              }
+
+              public synchronized void startListen(final Found cb) {
+                  stopListen();
+                  listenOn = true;
+                  Thread t = new Thread(new Runnable() {
+                      public void run() {
+                          try {
+                              listenSock = new DatagramSocket(null);
+                              listenSock.setReuseAddress(true);
+                              listenSock.bind(new InetSocketAddress(UDP_PORT));
+                              byte[] buf = new byte[512];
+                              while (listenOn) {
+                                  DatagramPacket p = new DatagramPacket(buf, buf.length);
+                                  listenSock.receive(p);
+                                  String s = new String(p.getData(), 0, p.getLength(), StandardCharsets.UTF_8);
+                                  String[] f = s.split("\\|");
+                                  if (f.length >= 3 && f[0].equals("NINJABALL1")) {
+                                      try { cb.onFound(p.getAddress().getHostAddress(), Integer.parseInt(f[2].trim()), f[1]); } catch (NumberFormatException ignored) { }
+                                  }
+                              }
+                          } catch (Exception ignored) {
+                          } finally { if (listenSock != null) listenSock.close(); }
+                      }
+                  }, "discover");
+                  t.setDaemon(true);
+                  t.start();
+              }
+
+              public synchronized void stopListen() {
+                  listenOn = false;
+                  if (listenSock != null) listenSock.close();
+              }
+
+              static List<InetAddress> broadcastTargets() {
+                  List<InetAddress> r = new ArrayList<InetAddress>();
+                  try { r.add(InetAddress.getByName("255.255.255.255")); } catch (Exception ignored) { }
+                  try {
+                      for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                          if (!ni.isUp() || ni.isLoopback()) continue;
+                          for (InterfaceAddress ia : ni.getInterfaceAddresses()) {
+                              if (ia.getBroadcast() != null) r.add(ia.getBroadcast());
+                          }
+                      }
+                  } catch (Exception ignored) { }
+                  return r;
+              }
+
+              /** Site-local IPv4 addresses of this device (hotspot AP interface first). */
+              public static List<String[]> localIps() {
+                  List<String[]> r = new ArrayList<String[]>();
+                  try {
+                      for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                          if (!ni.isUp() || ni.isLoopback()) continue;
+                          for (InetAddress a : Collections.list(ni.getInetAddresses())) {
+                              if (a instanceof Inet4Address && a.isSiteLocalAddress()) r.add(new String[]{ni.getName(), a.getHostAddress()});
+                          }
+                      }
+                  } catch (Exception ignored) { }
+                  Collections.sort(r, new Comparator<String[]>() {
+                      public int compare(String[] x, String[] y) { return score(y[0]) - score(x[0]); }
+                      int score(String n) { n = n.toLowerCase(Locale.ROOT); return (n.startsWith("ap") || n.contains("softap") || n.startsWith("swlan")) ? 2 : n.startsWith("wlan") ? 1 : 0; }
+                  });
+                  return r;
+              }
+          }
+          __EOF__
+          mkdir -p "app/src/main/java/com/ninjaball/game"
+          cat > 'app/src/main/java/com/ninjaball/game/Bridge.java' <<'__EOF__'
+          package com.ninjaball.game;
+
+          import android.app.Activity;
+          import android.content.Context;
+          import android.net.wifi.WifiManager;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          import java.util.List;
+
+          /**
+           * JavaScript <-> native bridge, exposed to the game as window.NinjaNative.
+           * Host phone: native TCP/WebSocket server (WsServer) + UDP beacon. Everything is local, no internet.
+           * Native -> JS events are delivered through window.__nn(eventName, payload).
+           */
+          public class Bridge {
+              private final Activity act;
+              private final WebView web;
+              private WsServer server;
+              private final LanDiscovery lan = new LanDiscovery();
+              private WifiManager.MulticastLock mlock;
+
+              public Bridge(Activity a, WebView w) {
+                  act = a;
+                  web = w;
+              }
+
+              private void emit(final String ev, final String payload) {
+                  act.runOnUiThread(new Runnable() {
+                      public void run() {
+                          web.evaluateJavascript("window.__nn&&window.__nn(" + JSONObject.quote(ev) + "," + JSONObject.quote(payload) + ")", null);
+                      }
+                  });
+              }
+
+              private void acquireMulticast() {
+                  try {
+                      if (mlock == null) {
+                          WifiManager wm = (WifiManager) act.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                          mlock = wm.createMulticastLock("ninjaball");
+                          mlock.setReferenceCounted(false);
+                      }
+                      if (!mlock.isHeld()) mlock.acquire();
+                  } catch (Exception ignored) { }
+              }
+
+              private void releaseMulticast() {
+                  try { if (mlock != null && mlock.isHeld()) mlock.release(); } catch (Exception ignored) { }
+              }
+
+              @JavascriptInterface
+              public boolean isNative() { return true; }
+
+              /** Starts the room server. Returns {"ok":true,"port":8765,"ips":[{"n":"wlan0","ip":"192.168.43.1"}]} */
+              @JavascriptInterface
+              public synchronized String startServer(int port) {
+                  try {
+                      stopServer();
+                      acquireMulticast();
+                      server = new WsServer(port, new WsServer.Listener() {
+                          public void onOpen(String addr) { emit("client_open", addr); }
+                          public void onMessage(String text) { emit("client_msg", text); }
+                          public void onClose() { emit("client_close", ""); }
+                      });
+                      server.start();
+                      JSONArray ips = new JSONArray();
+                      List<String[]> l = LanDiscovery.localIps();
+                      for (String[] x : l) {
+                          JSONObject o = new JSONObject();
+                          o.put("n", x[0]);
+                          o.put("ip", x[1]);
+                          ips.put(o);
+                      }
+                      JSONObject r = new JSONObject();
+                      r.put("ok", true);
+                      r.put("port", server.getPort());
+                      r.put("ips", ips);
+                      return r.toString();
+                  } catch (Exception e) {
+                      try {
+                          JSONObject r = new JSONObject();
+                          r.put("ok", false);
+                          r.put("err", String.valueOf(e.getMessage()));
+                          return r.toString();
+                      } catch (Exception ex) {
+                          return "{\"ok\":false,\"err\":\"unknown\"}";
+                      }
+                  }
+              }
+
+              @JavascriptInterface
+              public synchronized void stopServer() {
+                  lan.stopBeacon();
+                  if (server != null) {
+                      server.stop();
+                      server = null;
+                  }
+                  releaseMulticast();
+              }
+
+              @JavascriptInterface
+              public boolean send(String msg) {
+                  WsServer s = server;
+                  return s != null && s.send(msg);
+              }
+
+              @JavascriptInterface
+              public void kick() {
+                  WsServer s = server;
+                  if (s != null) s.kick();
+              }
+
+              @JavascriptInterface
+              public void startBeacon(String name) {
+                  WsServer s = server;
+                  if (s != null) lan.startBeacon(name, s.getPort());
+              }
+
+              @JavascriptInterface
+              public void stopBeacon() { lan.stopBeacon(); }
+
+              @JavascriptInterface
+              public void startDiscovery() {
+                  acquireMulticast();
+                  lan.startListen(new LanDiscovery.Found() {
+                      public void onFound(String ip, int port, String name) {
+                          try {
+                              JSONObject o = new JSONObject();
+                              o.put("ip", ip);
+                              o.put("port", port);
+                              o.put("name", name);
+                              emit("found", o.toString());
+                          } catch (Exception ignored) { }
+                      }
+                  });
+              }
+
+              @JavascriptInterface
+              public void stopDiscovery() {
+                  lan.stopListen();
+                  if (server == null) releaseMulticast();
+              }
+
+              public void shutdown() {
+                  lan.stopListen();
+                  stopServer();
+              }
+          }
+          __EOF__
+          mkdir -p "app/src/main/java/com/ninjaball/game"
+          cat > 'app/src/main/java/com/ninjaball/game/MainActivity.java' <<'__EOF__'
+          package com.ninjaball.game;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          public class MainActivity extends Activity {
+              private WebView web;
+              private Bridge bridge;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  web = new WebView(this);
+                  setContentView(web);
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);          // localStorage = save data
+                  s.setAllowFileAccess(true);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  bridge = new Bridge(this, web);
+                  web.addJavascriptInterface(bridge, "NinjaNative");
+                  web.setWebViewClient(new WebViewClient());
+                  web.setWebChromeClient(new WebChromeClient());
+                  web.loadUrl("file:///android_asset/index.html");
+              }
+
+              @Override
+              public void onWindowFocusChanged(boolean f) {
+                  super.onWindowFocusChanged(f);
+                  if (f) web.setSystemUiVisibility(View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN
+                          | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+              }
+
+              @Override
+              public void onBackPressed() {
+                  web.evaluateJavascript("(function(){try{if(cur=='home')return 'exit';goBack();return 'ok'}catch(e){return 'exit'}})()", new ValueCallback<String>() {
+                      public void onReceiveValue(String v) {
+                          if (v == null || v.contains("exit")) finish();
+                      }
+                  });
+              }
+
+              @Override
+              protected void onDestroy() {
+                  if (bridge != null) bridge.shutdown();
+                  if (web != null) web.destroy();
+                  super.onDestroy();
+              }
+          }
+          __EOF__
+          mkdir -p app/src/main/assets app/src/main/res/drawable
+          cp "$GITHUB_WORKSPACE/index.html" app/src/main/assets/index.html
+          cp "$GITHUB_WORKSPACE/ninja_ball_icon.png" app/src/main/res/drawable/ic_launcher.png
+          echo "Android project generated:"
+          find . -type f | sort
+
+      - name: Build APK
+        working-directory: _android
+        run: gradle assembleDebug --stacktrace --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NinjaBall-apk
+          path: _android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
